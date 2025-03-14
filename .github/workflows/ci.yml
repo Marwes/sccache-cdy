@@ -1,0 +1,174 @@
+name: ci
+on: [ push, pull_request ]
+
+env:
+  SCCACHE_BIN_DIR: sccache/target/release
+  SCCACHE_FILE: sccache
+  SCCACHE_DIST_FILE: sccache-dist
+
+jobs:
+  sccache:
+    name: sccache
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [git]
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: "`rust` ~ install"
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: ${{ matrix.rustc }}
+
+      - name: "`sccache` ~ cached"
+        uses: actions/cache@v4
+        id: cache
+        with:
+          path: |
+            ${{ env.SCCACHE_BIN_DIR }}/${{ env.SCCACHE_FILE }}
+            ${{ env.SCCACHE_BIN_DIR }}/${{ env.SCCACHE_DIST_FILE }}
+          key: sccache-${{ matrix.version }}-${{ runner.os }}
+
+      - name: "`sccache` ~ install (git)"
+        if: steps.cache.outputs.cache-hit != 'true' && contains(matrix.version, 'git')
+        run: |
+          echo ${{ matrix.version }}
+          git clone $SCCACHE_URL
+          cd sccache
+          cargo build --locked --release --features=dist-server
+        env:
+          SCCACHE_URL: https://github.com/mozilla/sccache.git
+
+
+      - name: "`sccache` ~ install (bin)"
+        if: steps.cache.outputs.cache-hit != 'true' && !contains(matrix.version, 'git')
+        run: |
+          curl $SCCACHE_URL -Lo $SCCACHE_ARCHIVE
+          curl $SCCACHE_DIST_URL -Lo $SCCACHE_DIST_ARCHIVE
+          tar -xvf $SCCACHE_ARCHIVE
+          tar -xvf $SCCACHE_DIST_ARCHIVE
+          mv $SCCACHE_ARCHIVE_DIR/$SCCACHE_FILE $SCCACHE_DIST_ARCHIVE_DIR/$SCCACHE_DIST_FILE $SCCACHE_BIN_DIR
+        env:
+          SCCACHE_URL: https://github.com/mozilla/sccache/releases/download/${{ matrix.version }}/sccache-${{ matrix.version }}-x86_64-unknown-linux-musl.tar.gz
+          SCCACHE_DIST_URL: https://github.com/mozilla/sccache/releases/download/${{ matrix.version }}/sccache-dist-${{ matrix.version }}-x86_64-unknown-linux-musl.tar.gz
+          SCCACHE_ARCHIVE: sccache.tar.gz
+          SCCACHE_DIST_ARCHIVE: sccache-dist.tar.gz
+          SCCACHE_ARCHIVE_DIR: sccache-${{ matrix.version }}-x86_64-unknown-linux-musl
+          SCCACHE_DIST_ARCHIVE_DIR: sccache-dist-${{ matrix.version }}-x86_64-unknown-linux-musl
+
+  test:
+    name: sccache-${{ matrix.version }} ${{ matrix.os }} rust-${{ matrix.rustc || 'stable' }} ${{ matrix.buildserver }}
+    runs-on: ${{ matrix.os }}
+    needs: sccache
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [git]
+        os: [ubuntu-24.04]
+        rustc: [stable]
+        buildserver: [local, overlay, docker]
+    env:
+      RUST_BACKTRACE: 1
+      SCCACHE_BIN_DIR: sccache/target/release
+      SCCACHE_FILE: sccache
+      SCCACHE_DIST_FILE: sccache-dist
+    steps:
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Clone repository
+        uses: actions/checkout@v4
+
+      - name: "`rust` ~ install"
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: ${{ matrix.rustc }}
+
+      - name: "`sccache` ~ cached"
+        uses: actions/cache/restore@v4
+        id: cache
+        with:
+          path: |
+            ${{ env.SCCACHE_BIN_DIR }}/${{ env.SCCACHE_FILE }}
+            ${{ env.SCCACHE_BIN_DIR }}/${{ env.SCCACHE_DIST_FILE }}
+          key: sccache-${{ matrix.version }}-${{ runner.os }}
+          fail-on-cache-miss: true
+
+
+      - name: "`sccache` ~ install"
+        run: sudo cp $SCCACHE_BIN_DIR/$SCCACHE_FILE $SCCACHE_BIN_DIR/$SCCACHE_DIST_FILE $BIN_DIR
+        env:
+          BIN_DIR: /usr/bin
+
+      - name: "`bwrap` ~ install"
+        run: sudo apt install -y --no-install-recommends bubblewrap
+
+
+      - name: "`sccache` ~ config"
+        run: ./.github/conf.sh
+
+      - name: "`systemd` ~ config"
+        run: ./.github/systemd.sh
+
+      - name: "`scheduler` ~ start"
+        run: sudo systemctl start sccache-scheduler
+
+
+      - name: "`scheduler` ~ status"
+        run: systemctl status sccache-scheduler
+
+
+      - name: "`buildserver` ~ start"
+        run: sudo systemctl start sccache-buildserver-${{ matrix.buildserver }}
+
+
+      - name: "`buildserver` ~ status"
+        run: systemctl status sccache-buildserver-${{ matrix.buildserver }}
+
+      - name: "`sccache` ~ log"
+        run:           SCCACHE_ERROR_LOG=$HOME/.config/sccache/sccache.log.txt sccache --start-server
+        env:
+          SCCACHE_NO_DAEMON: 1
+          SCCACHE_LOG: trace,hyper=off,tokio_util=info
+
+      - name: "`sccache` ~ dist status"
+        run: sccache --show-stats && sccache --dist-status
+
+
+      - name: "Clean"
+        run: cargo clean
+
+      - name: "Build"
+        run: cargo build --locked --release
+        timeout-minutes: 2
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_LOG: debug
+
+
+      - name: "`buildserver` ~ status"
+        if: always()
+        run: systemctl status sccache-buildserver-${{ matrix.buildserver }}
+
+      - name: "`sccache` ~ dist status"
+        if: always()
+        run: sccache --show-stats && sccache --dist-status
+
+      - name: "`scheduler` ~ journal"
+        if: always()
+        run: journalctl -eu sccache-scheduler
+
+      - name: "`buildserver` ~ journal"
+        if: always()
+        run: journalctl -eu sccache-buildserver-${{ matrix.buildserver }}
+
+      - name: "`sccache` ~ show log"
+        if: always()
+        run: cat $HOME/.config/sccache/sccache.log.txt
